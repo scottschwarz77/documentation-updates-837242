@@ -1,0 +1,338 @@
+*** Begin Patch
+*** Add File: stored-procedures/developer-procedures.md
++# Developer profile stored procedures
++
++This page provides example stored-procedure signatures, sample SQL bodies, validation and authorization patterns, audit/logging schemas, pagination/index guidance, bulk operations, instrumentation, migration artifacts, and testing guidance for a "developers" profile (username, email, bio, skills, social links). Examples target PostgreSQL (>= 12). Adapt as needed for MySQL.
++
++## Table of contents
++- Overview and conventions
++- Table schemas
++- Procedure signatures and types
++- Example procedure bodies
++  - CreateDeveloper
++  - GetDeveloperById
++  - UpdateDeveloper
++  - DeleteDeveloper (soft-delete)
++  - ListDevelopers (paging)
++- Validation helper: ValidateDeveloperInput
++- Authorization helpers and patterns
++- Error handling and audit logging
++- Bulk operations and upsert
++- Index recommendations and EXPLAIN guidance
++- Instrumentation and metrics
++- Migration and release artifacts (example V1 migration + rollback)
++- Testing: unit tests and CI integration patterns
++
++## Overview and conventions
++- Prefer using SQL functions (RETURNS TABLE or RECORD) when you need to return rows; use CREATE PROCEDURE when you need CALL semantics (and may manage transactions). This doc uses a mix: functions for reads, procedures/functions for writes depending on return shape.
++- Standardize return patterns:
++  - Successful create: return row (including id, created_at) or OUT id, created_at.
++  - Failure: raise a controlled exception with SQLSTATE or return a standardized JSON error object (choose one per project).
++- Use PL/pgSQL exception blocks to capture constraint violations and write structured logs to an audit table.
++- Validation helper returns boolean and an optional message or raises exception for immediate aborts.
++
++## Table schemas (examples)
++CREATE TABLE developers (
++    id bigserial PRIMARY KEY,
++    username text NOT NULL UNIQUE,
++    email text NOT NULL UNIQUE,
++    bio text,
++    skills jsonb DEFAULT '[]'::jsonb,
++    social_links jsonb DEFAULT '{}'::jsonb,
++    created_at timestamptz NOT NULL DEFAULT now(),
++    updated_at timestamptz,
++    deleted_at timestamptz,
++    deleted_by bigint
++);
++
++CREATE TABLE developer_procedure_logs (
++    id bigserial PRIMARY KEY,
++    procedure_name text NOT NULL,
++    input_snapshot jsonb,
++    error_message text,
++    error_code text,
++    executed_by bigint,
++    created_at timestamptz NOT NULL DEFAULT now()
++);
++
++CREATE TABLE developer_procedure_metrics (
++    id bigserial PRIMARY KEY,
++    procedure_name text NOT NULL,
++    execution_time_ms integer,
++    rows_affected integer,
++    created_at timestamptz NOT NULL DEFAULT now()
++);
++
++## Procedure signatures and types (recommended)
++- CreateDeveloper(username text, email text, bio text DEFAULT NULL, skills_json jsonb DEFAULT '[]'::jsonb, created_by bigint)
++  - Returns: TABLE(id bigint, created_at timestamptz) or function that RETURNS RECORD with OUT id, created_at.
++  - On failure: raise exception with SQLSTATE or RAISE EXCEPTION 'conflict' USING ERRCODE = 'P0001' (or return JSON error object).
++
++- GetDeveloperById(dev_id bigint)
++  - Returns: developers row as TABLE or RECORD, with skills and social_links as JSONB.
++  - On not found: return NULL row (i.e., empty result) or raise NOT FOUND depending on API convention.
++
++- UpdateDeveloper(dev_id bigint, email text DEFAULT NULL, bio text DEFAULT NULL, skills_json jsonb DEFAULT NULL, current_user_id bigint)
++  - Returns: updated row (RECORD) or boolean + updated_at.
++  - On permission denied: raise controlled exception with code 'permission_denied' or SQLSTATE 'P0003'.
++
++- DeleteDeveloper(dev_id bigint, current_user_id bigint, hard_delete boolean DEFAULT false)
++  - Returns: boolean (true if deleted).
++  - Default: perform soft delete by setting deleted_at and deleted_by; if hard_delete=true, perform hard DELETE.
++
++- ListDevelopers(limit integer DEFAULT 50, offset integer DEFAULT 0, sort_by text DEFAULT 'created_at')
++  - Returns: SETOF developers (paged).
++  - Support keyset pagination variant: ListDevelopersKeyset(limit integer, last_id bigint, last_value text, sort_by text)
++
++## Example procedure bodies
++
++-- CreateDeveloper (function returning id and created_at)
++CREATE OR REPLACE FUNCTION CreateDeveloper(
++    in_username text,
++    in_email text,
++    in_bio text DEFAULT NULL,
++    in_skills jsonb DEFAULT '[]'::jsonb,
++    in_created_by bigint DEFAULT NULL
++) RETURNS TABLE (id bigint, created_at timestamptz)
++LANGUAGE plpgsql AS $$
++DECLARE
++    v_exists boolean;
++    v_now timestamptz := now();
++BEGIN
++    -- Input validation: username/email basic checks (delegated to ValidateDeveloperInput)
++    PERFORM ValidateDeveloperInput(in_username, in_email, in_skills);
++
++    -- Check uniqueness
++    IF EXISTS (SELECT 1 FROM developers WHERE username = in_username) THEN
++        RAISE EXCEPTION 'username_conflict' USING ERRCODE = 'P0001';
++    END IF;
++    IF EXISTS (SELECT 1 FROM developers WHERE email = in_email) THEN
++        RAISE EXCEPTION 'email_conflict' USING ERRCODE = 'P0001';
++    END IF;
++
++    INSERT INTO developers (username, email, bio, skills, created_at)
++    VALUES (in_username, in_email, in_bio, COALESCE(in_skills, '[]'::jsonb), v_now)
++    RETURNING id, created_at INTO id, created_at;
++
++    RETURN NEXT;
++EXCEPTION WHEN OTHERS THEN
++    -- Log and re-raise
++    INSERT INTO developer_procedure_logs(procedure_name, input_snapshot, error_message, error_code, executed_by)
++    VALUES ('CreateDeveloper', jsonb_build_object('username', in_username, 'email', in_email, 'bio', in_bio, 'skills', in_skills), SQLERRM, SQLSTATE, in_created_by);
++    RAISE;
++END;
++$$;
++
++-- GetDeveloperById
++CREATE OR REPLACE FUNCTION GetDeveloperById(in_dev_id bigint) RETURNS TABLE (
++    id bigint, username text, email text, bio text, skills jsonb, social_links jsonb, created_at timestamptz, updated_at timestamptz, deleted_at timestamptz
++) LANGUAGE plpgsql AS $$
++BEGIN
++    RETURN QUERY
++    SELECT id, username, email, bio, skills, social_links, created_at, updated_at, deleted_at
++    FROM developers
++    WHERE id = in_dev_id;
++END;
++$$;
++
++-- UpdateDeveloper: partial updates (only non-null inputs), with auth check
++CREATE OR REPLACE FUNCTION UpdateDeveloper(
++    in_dev_id bigint,
++    in_email text DEFAULT NULL,
++    in_bio text DEFAULT NULL,
++    in_skills jsonb DEFAULT NULL,
++    in_current_user_id bigint
++) RETURNS TABLE (id bigint, username text, email text, bio text, skills jsonb, updated_at timestamptz)
++LANGUAGE plpgsql AS $$
++DECLARE
++    v_row developers%ROWTYPE;
++BEGIN
++    -- Existence check
++    SELECT * INTO v_row FROM developers WHERE id = in_dev_id AND deleted_at IS NULL;
++    IF NOT FOUND THEN
++        RETURN; -- returns no rows (caller interprets as not found)
++    END IF;
++
++    -- Authorization example: allow update if admin or owner
++    PERFORM CheckIsAdminOrOwner(in_current_user_id, in_dev_id); -- raises if unauthorized
++
++    -- Apply partial updates
++    UPDATE developers SET
++        email = COALESCE(in_email, email),
++        bio = COALESCE(in_bio, bio),
++        skills = COALESCE(in_skills, skills),
++        updated_at = now()
++    WHERE id = in_dev_id
++    RETURNING id, username, email, bio, skills, updated_at INTO id, username, email, bio, skills, updated_at;
++
++    RETURN NEXT;
++EXCEPTION WHEN OTHERS THEN
++    INSERT INTO developer_procedure_logs(procedure_name, input_snapshot, error_message, error_code, executed_by)
++    VALUES ('UpdateDeveloper', jsonb_build_object('id', in_dev_id, 'email', in_email, 'bio', in_bio, 'skills', in_skills), SQLERRM, SQLSTATE, in_current_user_id);
++    RAISE;
++END;
++$$;
++
++-- DeleteDeveloper: soft delete by default
++CREATE OR REPLACE FUNCTION DeleteDeveloper(in_dev_id bigint, in_current_user_id bigint, in_hard_delete boolean DEFAULT false) RETURNS boolean
++LANGUAGE plpgsql AS $$
++BEGIN
++    PERFORM CheckIsAdminOrOwner(in_current_user_id, in_dev_id); -- raises if unauthorized
++
++    IF in_hard_delete THEN
++        DELETE FROM developers WHERE id = in_dev_id;
++        RETURN FOUND;
++    ELSE
++        UPDATE developers SET deleted_at = now(), deleted_by = in_current_user_id WHERE id = in_dev_id;
++        RETURN FOUND;
++    END IF;
++EXCEPTION WHEN OTHERS THEN
++    INSERT INTO developer_procedure_logs(procedure_name, input_snapshot, error_message, error_code, executed_by)
++    VALUES ('DeleteDeveloper', jsonb_build_object('id', in_dev_id, 'hard_delete', in_hard_delete), SQLERRM, SQLSTATE, in_current_user_id);
++    RAISE;
++END;
++$$;
++
++-- ListDevelopers with LIMIT/OFFSET
++CREATE OR REPLACE FUNCTION ListDevelopers(in_limit integer DEFAULT 50, in_offset integer DEFAULT 0, in_sort_by text DEFAULT 'created_at') RETURNS SETOF developers
++LANGUAGE plpgsql AS $$
++BEGIN
++    RETURN QUERY EXECUTE format('SELECT * FROM developers WHERE deleted_at IS NULL ORDER BY %I DESC LIMIT $1 OFFSET $2', in_sort_by) USING in_limit, in_offset;
++END;
++$$;
++
++-- Keyset pagination pattern example (minimal)
++CREATE OR REPLACE FUNCTION ListDevelopersKeyset(in_limit integer DEFAULT 50, in_last_created_at timestamptz DEFAULT NULL) RETURNS SETOF developers
++LANGUAGE plpgsql AS $$
++BEGIN
++    IF in_last_created_at IS NULL THEN
++        RETURN QUERY SELECT * FROM developers WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT in_limit;
++    ELSE
++        RETURN QUERY SELECT * FROM developers WHERE deleted_at IS NULL AND created_at < in_last_created_at ORDER BY created_at DESC LIMIT in_limit;
++    END IF;
++END;
++$$;
++
++## Validation helper
++-- ValidateDeveloperInput: raises exception on invalid input
++CREATE OR REPLACE FUNCTION ValidateDeveloperInput(in_username text, in_email text, in_skills jsonb) RETURNS boolean
++LANGUAGE plpgsql AS $$
++BEGIN
++    IF in_username IS NULL OR length(trim(in_username)) < 3 OR length(in_username) > 50 THEN
++        RAISE EXCEPTION 'invalid_username' USING ERRCODE = 'P0002';
++    END IF;
++    IF in_username ~ '[^a-zA-Z0-9_.-]' THEN
++        RAISE EXCEPTION 'invalid_username_chars' USING ERRCODE = 'P0002';
++    END IF;
++    IF in_email !~* '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$' THEN
++        RAISE EXCEPTION 'invalid_email' USING ERRCODE = 'P0002';
++    END IF;
++    -- Ensure skills is JSON array
++    IF in_skills IS NOT NULL AND jsonb_typeof(in_skills) <> 'array' THEN
++        RAISE EXCEPTION 'invalid_skills_format' USING ERRCODE = 'P0002';
++    END IF;
++    RETURN true;
++END;
++$$;
++
++## Authorization helper
++-- CheckIsAdminOrOwner: example pattern. Replace check by real role lookup.
++CREATE OR REPLACE FUNCTION CheckIsAdminOrOwner(in_user_id bigint, in_dev_id bigint) RETURNS boolean
++LANGUAGE plpgsql AS $$
++DECLARE
++    v_is_admin boolean := false;
++    v_owner_id bigint;
++BEGIN
++    -- Placeholder admin check (replace with real role lookup)
++    SELECT EXISTS(SELECT 1 FROM users_roles ur WHERE ur.user_id = in_user_id AND ur.role = 'admin') INTO v_is_admin;
++    SELECT id INTO v_owner_id FROM developers WHERE id = in_dev_id LIMIT 1;
++    IF v_is_admin OR v_owner_id = in_user_id THEN
++        RETURN true;
++    ELSE
++        RAISE EXCEPTION 'permission_denied' USING ERRCODE = 'P0003';
++    END IF;
++END;
++$$;
++
++## Error handling and audit logging patterns
++- Use BEGIN...EXCEPTION blocks to catch OTHERS, log the input_snapshot and SQLERRM with SQLSTATE into developer_procedure_logs, then re-raise or return a standardized error.
++- Use consistent ERRCODE values for common classes (P0001 conflict, P0002 validation, P0003 permission).
++
++## Bulk operations and upsert
++-- Bulk insert using jsonb_to_recordset
++CREATE OR REPLACE FUNCTION CreateDevelopersBulk(in_payload jsonb, in_created_by bigint) RETURNS integer
++LANGUAGE plpgsql AS $$
++DECLARE
++    v_rows integer := 0;
++BEGIN
++    INSERT INTO developers (username, email, bio, skills, created_at)
++    SELECT p.username, p.email, p.bio, p.skills::jsonb, now()
++    FROM jsonb_to_recordset(in_payload) AS p(username text, email text, bio text, skills jsonb);
++
++    GET DIAGNOSTICS v_rows = ROW_COUNT;
++    INSERT INTO developer_procedure_metrics (procedure_name, execution_time_ms, rows_affected)
++    VALUES ('CreateDevelopersBulk', 0, v_rows); -- measure execution_time_ms if desired
++    RETURN v_rows;
++END;
++$$;
++
++-- Upsert bulk (example using ON CONFLICT)
++CREATE OR REPLACE FUNCTION UpsertDevelopersBulk(in_payload jsonb, in_upsert_by bigint) RETURNS integer
++LANGUAGE plpgsql AS $$
++DECLARE
++    v_rows integer := 0;
++BEGIN
++    INSERT INTO developers (username, email, bio, skills, created_at)
++    SELECT p.username, p.email, p.bio, p.skills::jsonb, now()
++    FROM jsonb_to_recordset(in_payload) AS p(username text, email text, bio text, skills jsonb)
++    ON CONFLICT (username) DO UPDATE SET
++        email = EXCLUDED.email,
++        bio = EXCLUDED.bio,
++        skills = EXCLUDED.skills,
++        updated_at = now();
++
++    GET DIAGNOSTICS v_rows = ROW_COUNT;
++    RETURN v_rows;
++END;
++$$;
++
++## Index recommendations
++- CREATE UNIQUE INDEX idx_developers_username ON developers(username);
++- CREATE UNIQUE INDEX idx_developers_email ON developers(email);
++- CREATE INDEX idx_developers_created_at ON developers(created_at);
++- CREATE INDEX idx_developers_last_active ON developers((social_links->>'last_active')) -- if last_active is stored in JSON (adjust type).
++
++Note: adding indexes speeds reads but slows writes and increases storage. Add indexes based on query patterns (EXPLAIN before/after).
++
++## Instrumentation and metrics
++- Measure execution time by recording clock_timestamp() before and after main body, compute delta in ms, and INSERT into developer_procedure_metrics.
++- Example (pattern):
++-- DECLARE v_start timestamptz := clock_timestamp(); ... v_elapsed_ms := extract(epoch from (clock_timestamp() - v_start)) * 1000;
++
++## Migration and release artifacts
++- Example migration file: V1__create_developer_procedures.sql
++-- Include CREATE TABLE developers, developer_procedure_logs, developer_procedure_metrics and CREATE FUNCTION definitions for all procedures above.
++
++- Example rollback script: U1__drop_developer_procedures.sql
++-- DROP FUNCTION IF EXISTS CreateDeveloper(...); DROP TABLE IF EXISTS developer_procedure_metrics; etc.
++
++Release process (recommended):
++1. Deploy migration to staging.
++2. Run automated unit & integration tests against ephemeral DB.
++3. Smoke test create/read/update flows.
++4. Monitor metrics/latency baseline, then deploy to production.
++
++## Testing guidelines
++- Unit tests: use pgTAP or psql scripts to:
++  - call CreateDeveloper with valid data and assert id returned.
++  - call CreateDeveloper with duplicate username/email and assert expected conflict exception.
++  - call GetDeveloperById for existing and non-existing id and assert behavior.
++  - call UpdateDeveloper to change email/bio and assert persisted changes.
++  - call DeleteDeveloper then GetDeveloperById to validate soft-delete semantics.
++
++- Integration/CI: Use containerized ephemeral database (Docker Compose or GitHub Actions services), apply migration SQL, seed minimal data, run tests, then teardown.
++
++## EXPLAIN guidance
++- Use EXPLAIN (ANALYZE, BUFFERS) for key queries (ListDevelopers, bulk upsert). Capture plans pre/post-indexing and record in runbook.
++
+*** End Patch
