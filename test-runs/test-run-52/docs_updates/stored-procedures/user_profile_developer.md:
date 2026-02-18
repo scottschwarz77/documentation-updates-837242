@@ -1,0 +1,255 @@
+Title: User Profile Developer: schema, stored-procedure signatures, auditing, error codes, and test guidance
+
+Summary:
+This page provides a recommended table schema, audit table schema, standardized error codes, canonical stored-procedure signatures for CRUD + list/search operations, sample patterns for optimistic concurrency, and example unit-test approaches.
+
+1) Recommended base table schema (PostgreSQL example)
+
+-- user profile developer table
+CREATE TABLE user_profile_developer (
+    id              BIGSERIAL PRIMARY KEY,
+    username        TEXT NOT NULL,
+    email           TEXT NOT NULL,
+    bio             TEXT DEFAULT '',
+    avatar_url      TEXT,
+    role            TEXT NOT NULL, -- recommended to reference a roles table if your app has many attributes
+    is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+    is_deleted      BOOLEAN NOT NULL DEFAULT FALSE, -- if using soft-delete
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at      TIMESTAMPTZ,
+    deleted_by      TEXT,
+    row_version     BIGINT NOT NULL DEFAULT 1
+);
+
+-- Recommended constraints & indexes:
+ALTER TABLE user_profile_developer ADD CONSTRAINT uq_user_email UNIQUE (email) DEFERRABLE INITIALLY IMMEDIATE;
+ALTER TABLE user_profile_developer ADD CONSTRAINT uq_user_username UNIQUE (username) DEFERRABLE INITIALLY IMMEDIATE;
+
+-- Indexes for common filters and sorts
+CREATE INDEX idx_user_profile_role_active ON user_profile_developer (role, is_active) WHERE (is_deleted = false);
+CREATE INDEX idx_user_profile_username_lower ON user_profile_developer (lower(username)) WHERE (is_deleted = false);
+
+Notes:
+- If you implement soft-delete (is_deleted), use partial unique indexes or include is_deleted in the uniqueness logic to allow reusing values on deleted rows (see examples below).
+- Use DEFERRABLE where you need to defer uniqueness checks across transactions, but prefer immediate checks in most cases.
+
+2) Audit table schema and recommended minimal record format
+
+CREATE TABLE user_profile_audit (
+    audit_id    BIGSERIAL PRIMARY KEY,
+    entity_id   BIGINT NOT NULL, -- references user_profile_developer(id)
+    operation   TEXT NOT NULL,   -- 'CREATE','UPDATE','DELETE','RESTORE'
+    changed_by  TEXT NOT NULL,   -- principal who made change (user id or system principal)
+    changed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    diff_json   JSONB,           -- minimal diff: { "field": { "old": x, "new": y }, ... }
+    reason      TEXT
+);
+
+Design note:
+- Prefer concise diff_json that contains only changed fields. Example for update: {"bio":{"old":"old","new":"new"}, "is_active":{"old":true,"new":false}}
+- Write audit records inside the same transaction as the data mutation to ensure atomicity. See example procedure patterns below.
+
+3) Standardized error codes and messages (recommended)
+
+Return codes for SPs (numeric + optional text):
+0 = OK (success)
+1 = ValidationError (input validation failed)
+2 = NotFound (entity not found)
+3 = Conflict (uniqueness or optimistic concurrency conflict)
+4 = PermissionDenied (authorization failure)
+5 = InternalError (unexpected server error)
+
+Pattern:
+- Procedures should return a composite result (status_code INT, status_message TEXT, payload JSONB) or use OUT parameters. Keep error-code mapping consistent across all SPs.
+
+4) Canonical stored-procedure signatures (examples)
+
+-- Create: validates inputs, enforces uniqueness, returns new id
+CREATE PROCEDURE CreateUserProfileDeveloper(
+    IN p_username TEXT,
+    IN p_email TEXT,
+    IN p_bio TEXT,
+    IN p_avatar_url TEXT,
+    IN p_role TEXT,
+    IN p_created_by TEXT,
+    OUT o_status_code INT,
+    OUT o_status_message TEXT,
+    OUT o_id BIGINT
+) LANGUAGE plpgsql AS $$
+BEGIN
+    -- server-side validation examples (lengths, email pattern, allowed roles)
+    IF p_username IS NULL OR length(trim(p_username)) = 0 THEN
+        o_status_code := 1; o_status_message := 'username required'; RETURN;
+    END IF;
+    IF p_email IS NULL OR length(trim(p_email)) = 0 THEN
+        o_status_code := 1; o_status_message := 'email required'; RETURN;
+    END IF;
+    -- simple email pattern check (replace with stricter check as needed)
+    IF p_email !~* '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$' THEN
+        o_status_code := 1; o_status_message := 'invalid email format'; RETURN;
+    END IF;
+
+    BEGIN
+        INSERT INTO user_profile_developer (username, email, bio, avatar_url, role, created_at, updated_at)
+        VALUES (p_username, p_email, coalesce(p_bio,''), p_avatar_url, p_role, now(), now())
+        RETURNING id INTO o_id;
+
+        -- write audit record in same transaction
+        INSERT INTO user_profile_audit (entity_id, operation, changed_by, diff_json)
+        VALUES (o_id, 'CREATE', p_created_by, jsonb_build_object('initial', jsonb_build_object(
+            'username', p_username, 'email', p_email, 'role', p_role)));
+
+        o_status_code := 0; o_status_message := 'OK';
+    EXCEPTION WHEN unique_violation THEN
+        o_status_code := 3; o_status_message := 'duplicate key';
+        o_id := NULL;
+        RETURN;
+    WHEN OTHERS THEN
+        o_status_code := 5; o_status_message := SQLERRM;
+        o_id := NULL;
+        RETURN;
+    END;
+END;
+$$;
+
+-- Get by id: returns a single record or NotFound
+CREATE PROCEDURE GetUserProfileDeveloperById(
+    IN p_id BIGINT,
+    OUT o_status_code INT,
+    OUT o_status_message TEXT,
+    OUT o_profile JSONB
+) LANGUAGE plpgsql AS $$
+DECLARE
+    r RECORD;
+BEGIN
+    SELECT id, username, email, bio, avatar_url, role, is_active, created_at, updated_at, row_version
+    INTO r
+    FROM user_profile_developer
+    WHERE id = p_id AND is_deleted = false;
+
+    IF NOT FOUND THEN
+        o_status_code := 2; o_status_message := 'NotFound'; o_profile := NULL; RETURN;
+    END IF;
+
+    o_profile := to_jsonb(r) - 'row_version'; -- example; include as needed
+    o_status_code := 0; o_status_message := 'OK';
+END;
+$$;
+
+-- List with offset/limit example (offset-based)
+CREATE PROCEDURE ListUserProfileDevelopers_Offset(
+    IN p_limit INT,
+    IN p_offset INT,
+    IN p_role TEXT DEFAULT NULL,
+    IN p_is_active BOOLEAN DEFAULT NULL,
+    IN p_search_text TEXT DEFAULT NULL,
+    OUT o_status_code INT,
+    OUT o_status_message TEXT,
+    OUT o_rows JSONB
+) LANGUAGE plpgsql AS $$
+BEGIN
+    -- build where conditions in strongly-typed manner; avoid unescaped dynamic SQL
+    SELECT jsonb_agg(row_to_json(t))
+    FROM (
+        SELECT id, username, email, role, is_active, created_at, updated_at
+        FROM user_profile_developer
+        WHERE (p_role IS NULL OR role = p_role)
+          AND (p_is_active IS NULL OR is_active = p_is_active)
+          AND (p_search_text IS NULL OR (username ILIKE '%' || p_search_text || '%' OR email ILIKE '%' || p_search_text || '%'))
+          AND is_deleted = false
+        ORDER BY username ASC
+        LIMIT GREATEST(1, p_limit) OFFSET GREATEST(0, p_offset)
+    ) t
+    INTO o_rows;
+
+    o_status_code := 0; o_status_message := 'OK';
+END;
+$$;
+
+-- Keyset pagination pattern (recommended for large result sets):
+-- Use WHERE (username, id) > (last_username, last_id) with an index on (username, id)
+-- See above index recommendation idx_user_profile_username_lower for ordering.
+
+5) Optimistic concurrency update pattern
+
+-- Update with expected_row_version
+CREATE PROCEDURE UpdateUserProfileDeveloper(
+    IN p_id BIGINT,
+    IN p_expected_row_version BIGINT,
+    IN p_username TEXT DEFAULT NULL,
+    IN p_email TEXT DEFAULT NULL,
+    IN p_bio TEXT DEFAULT NULL,
+    IN p_avatar_url TEXT DEFAULT NULL,
+    IN p_role TEXT DEFAULT NULL,
+    IN p_updated_by TEXT,
+    OUT o_status_code INT,
+    OUT o_status_message TEXT
+) LANGUAGE plpgsql AS $$
+DECLARE
+    cur_row_version BIGINT;
+BEGIN
+    SELECT row_version INTO cur_row_version
+    FROM user_profile_developer
+    WHERE id = p_id AND is_deleted = false;
+
+    IF NOT FOUND THEN
+        o_status_code := 2; o_status_message := 'NotFound'; RETURN;
+    END IF;
+
+    IF cur_row_version IS DISTINCT FROM p_expected_row_version THEN
+        o_status_code := 3; o_status_message := 'Conflict: row_version mismatch'; RETURN;
+    END IF;
+
+    UPDATE user_profile_developer
+    SET username = COALESCE(p_username, username),
+        email = COALESCE(p_email, email),
+        bio = COALESCE(p_bio, bio),
+        avatar_url = COALESCE(p_avatar_url, avatar_url),
+        role = COALESCE(p_role, role),
+        updated_at = now(),
+        row_version = row_version + 1
+    WHERE id = p_id AND row_version = p_expected_row_version
+    RETURNING row_version INTO cur_row_version;
+
+    IF NOT FOUND THEN
+        -- concurrent update happened
+        o_status_code := 3; o_status_message := 'Conflict: concurrent update'; RETURN;
+    END IF;
+
+    -- write audit record with minimal diff (implement a helper to compute diff)
+    INSERT INTO user_profile_audit (entity_id, operation, changed_by, diff_json)
+    VALUES (p_id, 'UPDATE', p_updated_by, jsonb_build_object('note', 'fields changed'));
+
+    o_status_code := 0; o_status_message := 'OK';
+END;
+$$;
+
+6) Audit writing recommendations
+- Write the audit record inside the same transaction as the mutating statement to guarantee atomicity.
+- Prefer explicit audit procedures that are called from mutating SPs rather than triggers when you want the audit insert to be obviously within the same SP flow; triggers are also valid but be mindful of exception handling and ownership/privilege contexts.
+
+7) Unit-test guidance (examples)
+- Use pgTAP or simple SQL scripts that:
+  * Create a test schema and test user.
+  * Run CreateUserProfileDeveloper with valid inputs; assert o_status_code = 0 and returned id not null.
+  * Run CreateUserProfileDeveloper with duplicate email; assert o_status_code = 3 (Conflict).
+  * Run CreateUserProfileDeveloper with invalid email; assert o_status_code = 1 (ValidationError).
+  * Run UpdateUserProfileDeveloper with stale expected_row_version; assert o_status_code = 3 (Conflict) and no change to row_version.
+  * Verify audit table contains a record for successful create/update/delete; verify that failed updates produce no audit record.
+
+Example pgTAP pseudocode:
+SELECT plan(5);
+SELECT is((CALL CreateUserProfileDeveloper('u1','u1@example.com',...)), expected_status_code, 'create OK');
+-- etc.
+
+8) Short checklist for SP implementers
+- Use strict parameter types and server-side validation.
+- Avoid dynamic SQL for core CRUD; if dynamic SQL is required use format() + USING and never interpolate user input directly.
+- Use standardized error codes and consistent messages.
+- Insert audit records inside the same transaction as the mutation.
+- Use optimistic concurrency (row_version) for update conflicts; return Conflict code on mismatch.
+- For list endpoints supporting large datasets, prefer keyset pagination and appropriate covering indexes.
+- Add partial unique indexes when using soft-delete to avoid uniqueness blocking when rows are marked deleted.
+
+End of file.
