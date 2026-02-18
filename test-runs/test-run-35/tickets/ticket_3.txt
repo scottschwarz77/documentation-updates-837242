@@ -1,0 +1,5 @@
+Ticket 3:
+Add concrete examples and templates for rollback automation:
+- Provide a versioned rollback script generator and an example "fast rollback" playbook that can be executed when a procedure change causes failures.
+- Include a recommended smoke test script to be run immediately post-rollback.
+This complements the migration guidance by providing executable rollback artifacts.
