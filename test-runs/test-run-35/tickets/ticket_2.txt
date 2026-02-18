@@ -1,0 +1,6 @@
+Ticket 2:
+Produce a benchmark harness and dataset generator:
+- A script to generate 10k realistic developer rows and insert them via CreateDevelopersBulk.
+- A test that runs ListDevelopers (paged) and measures latency (target example <200ms) on a specified hardware profile.
+- Collects EXPLAIN output and compares plan changes after adding recommended indexes.
+This is needed because performance targets and reproducible benchmarks can't be sufficiently represented in static docs.
