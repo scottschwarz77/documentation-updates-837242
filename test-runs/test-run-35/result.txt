@@ -1,0 +1,193 @@
+RUNNING TESTS
+=============
+
+USE CASE TEST 1
+---------------
+Use case: Developer stored-procedure CRUD (signatures, SQL bodies, tests)
+
+Task 1. Define procedure signatures
+Steps:
+1. Searched provided docs for examples of CREATE PROCEDURE / CREATE FUNCTION with OUT params and RETURNING patterns.
+2. Reviewed transaction-management.md for CALL usage and commit/rollback considerations.
+3. Reviewed cursorss.md for returning cursors (not directly relevant to signatures but helpful for ListDevelopers approach).
+
+Outcome: Partially completed.
+- transaction-management.md confirms CALL procedures exist and that COMMIT/ROLLBACK are allowed in CALL contexts.
+- No concrete examples in the provided docs showing recommended signature patterns (OUT parameters vs RETURNING rows) for CRUD operations, or standardized error code patterns.
+
+Issues found:
+- No example CRUD procedure signatures or conventions (e.g., whether to use PROCEDURE vs FUNCTION, how to return id or errors).
+- No standardized error/returning patterns documented (OUT params, JSON error objects, or numeric error codes).
+
+Task 2. Write SQL body for Create/Get/Update/Delete
+Steps:
+1. Searched docs for sample INSERT/UPDATE/DELETE procedure bodies and input validation patterns.
+2. Used transaction docs to check whether COMMIT can be done and cursor docs for JSON return hints.
+
+Outcome: Failed to find usable examples in docs to implement full bodies.
+- cursorss.md helps for returning cursor/large resultsets; transaction-management.md explains COMMIT semantics inside CALL.
+- No guidance or examples for: unique username/email checks, partial updates based on non-null params, returning created_at or updated row, JSON handling for skills/social links inside procedures, soft-delete patterns.
+
+Issues found:
+- Missing example SQL bodies for CreateDeveloper/GetDeveloperById/UpdateDeveloper/DeleteDeveloper demonstrating validation, uniqueness checks, JSON handling, partial updates, and soft-delete logic.
+- No example showing how to return newly inserted id and timestamps from within procedures.
+
+Task 3. Create simple unit tests
+Steps:
+1. Searched docs for testing approaches, example unit tests, and ephemeral DB CI guidance.
+2. Looked for mention of pgTAP or psql-based tests; none in provided docs.
+
+Outcome: Failed.
+- No instructions or examples for writing unit tests for stored procedures, or for ephemeral DB CI test harness.
+- transaction-management.md explains COMMIT/ROLLBACK but not test isolation or teardown/seeding patterns.
+
+Issues found:
+- No sample unit tests or guidance for test setup/teardown to validate procedure behavior.
+
+USE CASE TEST 2
+---------------
+Use case: Add auth/validation/error handling/audit logging to stored procedures.
+
+Task 1. Authentication and authorization checks
+Steps:
+1. Looked for guidance on implementing auth checks in procedures in provided docs.
+2. Checked transaction-management.md for role/permission guidance (none).
+
+Outcome: Failed.
+- No examples of accepting current_user_id param, checking roles, or returning standardized permission-denied error messages inside procedures.
+
+Issues found:
+- No documentation of patterns to perform authorization checks inside stored procedures (role checks, owner checks) or examples for error responses (e.g., ERROR 'permission_denied').
+
+Task 2. Input validation and centralized helper
+Steps:
+1. Searched for examples of input validation helpers and patterns for raising controlled exceptions.
+2. Reviewed PL/pgSQL cursor and transaction docs for exception handling mentions (transaction doc mentions exceptions vs savepoints indirectly).
+
+Outcome: Partially failed.
+- transaction-management.md hints that blocks with exception handlers form subtransactions (useful), but there are no concrete examples of centralized validation procedures or a recommended ValidateDeveloperInput implementation.
+
+Issues found:
+- No example ValidateDeveloperInput procedure or standardized return pattern (boolean + message or raising exception).
+- No examples demonstrating email format checks, username regex restrictions, or JSON validation for skills_json.
+
+Task 3. Error handling and logging
+Steps:
+1. Searched for examples showing BEGIN...EXCEPTION patterns and logging to audit tables.
+2. Checked transaction-management.md for exception handling guidance (it references that blocks with exception handlers form subtransactions but gives no example).
+
+Outcome: Partially completed.
+- Docs explain that blocks with exception handlers form subtransactions (useful), but there are no examples demonstrating capturing constraint violations, creating or writing to an audit table, or returning standardized error objects.
+
+Issues found:
+- No example of TRY/CATCH / BEGIN...EXCEPTION used to capture constraint violations and either return standardized error objects or write to an audit table.
+- No schema or example for developer_procedure_logs (fields and usage).
+
+USE CASE TEST 3
+---------------
+Use case: Read optimization, bulk ops, instrumentation and performance metrics
+
+Task 1. Pagination and index plan
+Steps:
+1. Looked for pagination examples (LIMIT/OFFSET vs keyset) and index recommendations.
+2. Reviewed cursorss.md for cursor-based large result handling.
+
+Outcome: Partially completed.
+- cursorss.md helps with returning a cursor for large resultsets (could be used as alternative to paging).
+- No specific recommendation for ListDevelopers pagination patterns, no example queries for keyset pagination, and no index plan guidance (which columns to index and the impact).
+
+Issues found:
+- No documentation of paging strategies for stored-procedure-backed list endpoints (no examples of LIMIT/OFFSET or keyset pagination queries).
+- No index recommendations for developers table (username/email unique constraints are standard but not documented here; last_active index not discussed).
+
+Task 2. Bulk operations and upsert
+Steps:
+1. Searched docs for unnest/json_to_recordset examples or multi-row inserts in procedures.
+2. Looked for upsert/ON CONFLICT examples inside procedures.
+
+Outcome: Failed.
+- No examples of bulk insert procedures (CreateDevelopersBulk) using unnest or json_to_recordset.
+- No example UpsertDevelopersBulk procedure demonstrating efficient upsert with minimal locking.
+
+Issues found:
+- Missing examples for bulk insert/upsert stored procedures and recommended transaction boundaries / batching strategy.
+
+Task 3. Instrumentation and performance tests
+Steps:
+1. Searched for examples of measuring execution time inside procedures or logging metrics.
+2. Sought sample data load scripts and recommended performance targets.
+
+Outcome: Failed.
+- No guidance on measuring execution_time_ms or rows_affected inside procedures, nor sample developer_procedure_metrics table schema.
+- No sample performance test scripts (10k inserts) or CI harness to measure ListDevelopers latency and EXPLAIN guidance for key queries.
+
+Issues found:
+- No instrumentation examples or schema for developer_procedure_metrics.
+- No performance test examples or sample EXPLAIN outputs and how to interpret them after adding indexes.
+
+USE CASE TEST 4
+---------------
+Use case: Deployment artifacts, CI integration tests, backward compatibility and rollback.
+
+Task 1. Deployment artifacts & release process
+Steps:
+1. Searched docs for sample migration scripts, versioning conventions (e.g., V1__create...), and rollback scripts.
+2. Reviewed transaction docs for transaction control in migrations.
+
+Outcome: Failed.
+- No example migration SQL files for creating procedures or rollback scripts.
+- No release process checklist in provided docs.
+
+Issues found:
+- Missing example migration and rollback scripts, versioning conventions, and release process guidance for stored-procedure deployments.
+
+Task 2. Integration tests on ephemeral CI DB
+Steps:
+1. Looked for guidelines to run integration tests in CI against ephemeral databases and how to seed/teardown.
+2. Searched for sample test harness or Docker/CI commands.
+
+Outcome: Failed.
+- No instructions for CI-managed ephemeral DB boot, applying schema + procedures, seeding, isolated tests, teardown steps.
+
+Issues found:
+- No CI integration test examples, ephemeral DB setup scripts, test isolation or teardown guidance.
+
+Task 3. Backward-compatible changes, rollback strategy, migration checklist
+Steps:
+1. Searched for documented patterns for adding nullable optional params, zero-downtime deployment strategies, and rollback checklists.
+2. Inspected transaction docs for COMMIT/ROLLBACK constraints affecting zero-downtime operations.
+
+Outcome: Partially completed.
+- transaction-management.md explains some transaction semantics (useful), but concrete strategies (add nullable params, versioned procedures, canarying, smoke tests) are not present.
+
+Issues found:
+- No documented step-by-step zero-downtime procedure rollout patterns or explicit rollback scripts/checklist for stored-procedure changes.
+
+AGGREGATE RESULTS
+
+Issue | Number of Occurrences | Percentage of Occurrences | Usability Dimension
+--- | ---: | ---: | ---
+No example CRUD procedure signatures or conventions (procedure vs function, return patterns) | 8 | 66.7% | Complete
+Lack of examples showing how to return values / standardized error return patterns (OUT params, JSON errors) | 6 | 50.0% | Clarity
+Insufficient guidance on CREATE/UPDATE/DELETE SQL bodies (uniqueness checks, partial updates, JSON handling, soft-delete) | 5 | 41.7% | Complete
+No guidance on procedure creation syntax and RETURN patterns in PostgreSQL (CREATE PROCEDURE vs FUNCTION usage) | 5 | 41.7% | Consistency
+No examples or patterns for tests/CI (unit tests, integration tests, ephemeral DB) | 4 | 33.3% | Findability on a page
+No examples for authorization checks inside procedures (role checks, owner checks) | 4 | 33.3% | Trustworthy
+No documentation of JSON input handling and validation (skills_json, social links) | 4 | 33.3% | Complete
+No guidance or examples for pagination (LIMIT/OFFSET vs keyset) and index plan recommendations | 3 | 25.0% | Complete
+No example centralized validation helper procedure (ValidateDeveloperInput) | 3 | 25.0% | Complete
+No examples for error handling with logging to audit table (developer_procedure_logs) | 3 | 25.0% | Trustworthy
+No examples or guidance for bulk insert/upsert procedures and batching strategy | 3 | 25.0% | Complete
+No instrumentation/performance logging examples or metrics table schema (developer_procedure_metrics) | 3 | 25.0% | Complete
+No migration/migration-script examples, rollback script, or release process for procedures | 3 | 25.0% | Consistency
+No sample performance tests (e.g., 10k rows) and EXPLAIN examples to validate indexing impact | 2 | 16.7% | Findability on a page
+
+Summary by Usability Dimension
+
+Usability Dimension | Number of Occurrences
+--- | ---:
+Complete | 9
+Clarity | 1
+Consistency | 2
+Findability on a page | 2
+Trustworthy | 2
