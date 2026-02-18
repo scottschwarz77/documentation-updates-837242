@@ -1,0 +1,7 @@
+Ticket 1:
+Create a small CI demo repository containing:
+- Docker Compose or GitHub Actions workflow that boots a PostgreSQL ephemeral DB.
+- Applies the V1__create_developer_procedures.sql migration.
+- Runs a scripted test suite (psql or pgTAP) that executes the CRUD tests described in the docs.
+- Records and exposes basic metrics (execution time) and artifacts (EXPLAIN outputs).
+This is needed because runnable CI scripts and workflows are required to validate the testing guidance in the docs.
