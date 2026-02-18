@@ -1,0 +1,179 @@
+This new document provides opinionated, example-driven guidance for implementing stored procedures for user profile management (create/read/update/delete), and addresses common implementation and testing needs.
+
+1) Reference data model (example)
+- Users table (authentication/identity):
+  - user_id SERIAL PRIMARY KEY
+  - username TEXT NOT NULL UNIQUE
+  - email TEXT NOT NULL UNIQUE
+  - password_hash TEXT NOT NULL   -- store hashed password only (hashing outside DB or in dedicated service)
+  - created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+  - last_login TIMESTAMP WITH TIME ZONE NULL
+
+- Profiles table (profile metadata):
+  - profile_id SERIAL PRIMARY KEY
+  - user_id INT NOT NULL REFERENCES Users(user_id)
+  - display_name TEXT
+  - role_id INT NOT NULL REFERENCES Roles(role_id)
+  - is_active BOOLEAN NOT NULL DEFAULT true
+  - created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+  - updated_at TIMESTAMP WITH TIME ZONE
+  - row_version BYTEA    -- optional: store a row-version/etag (see concurrency section)
+
+- Roles table:
+  - role_id SERIAL PRIMARY KEY
+  - role_name TEXT NOT NULL UNIQUE
+  - description TEXT
+
+- Audit table (example):
+  - audit_id SERIAL PRIMARY KEY
+  - entity_type TEXT NOT NULL
+  - entity_id INT NOT NULL
+  - action TEXT NOT NULL            -- e.g., CREATE, UPDATE, DELETE, SOFT_DELETE, RESTORE
+  - performed_by INT NULL           -- user_id of actor
+  - performed_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+  - details JSONB NULL              -- previous/new state or diff
+
+2) CreateUserProfile: procedure signature and example
+- Recommended parameters:
+  - IN p_username TEXT
+  - IN p_email TEXT
+  - IN p_display_name TEXT
+  - IN p_role_id INT
+  - IN p_performed_by INT NULL      -- user id performing operation (for audit)
+  - OUT o_profile_id INT
+  - OUT o_status_code INT
+  - OUT o_status_message TEXT
+
+- Example transactional pattern (PostgreSQL PL/pgSQL, callable via CALL):
+  - Use CREATE PROCEDURE (not FUNCTION) if you need COMMIT/ROLLBACK inside.
+  - Use parameterized SQL (use variable substitution in PL/pgSQL or EXECUTE ... USING for dynamic).
+  - Example skeleton:
+    - Begin procedure
+    - BEGIN TRANSACTION (implicit in CALL context; you may COMMIT/ROLLBACK explicitly per needs)
+    - Validation checks:
+      - Ensure required fields not null (username, email, role_id)
+      - Check uniqueness: SELECT 1 FROM users WHERE username = p_username OR email = p_email
+      - Check role exists: SELECT 1 FROM roles WHERE role_id = p_role_id
+    - If validation passes, INSERT into users/profiles (returning profile_id with RETURNING)
+    - INSERT audit record with details JSONB
+    - COMMIT
+    - Set o_status_code = 0, o_status_message = 'OK', o_profile_id = <new id>
+    - Exception handling (EXCEPTION WHEN others THEN ...)
+      - ROLLBACK if needed (procedures invoked via CALL may COMMIT/ROLLBACK)
+      - Map specific errors to status codes (e.g., 23505 -> duplicate key -> status_code 409)
+      - Set o_status_code and o_status_message accordingly
+  - Note: Example code snippets and a complete sample procedure are included below.
+
+3) Error handling and status-code conventions
+- Recommended status codes:
+  - 0 = success
+  - 400 = bad input / missing required field
+  - 404 = related entity not found (e.g., role_id)
+  - 409 = conflict (duplicate username/email)
+  - 412 = concurrency conflict (stale row_version)
+  - 500 = internal server error
+- Return both numeric code and message strings to allow application to map behavior.
+
+4) Password hashing and security guidance
+- Do not accept plain passwords in procedures unless your policy explicitly allows in-DB hashing.
+- Prefer hashing in application layer or an authentication service before calling DB.
+- If hashing in DB is required, use a well-audited, dedicated function and document the policy explicitly (but recommended: hash outside DB).
+
+5) Validation rules (examples)
+- Enforce uniqueness at schema level (UNIQUE indexes on username and email) and also check in code to give friendly messages.
+- Enforce NOT NULL at schema level for required fields.
+- Validate role_id via foreign key to Roles table.
+
+6) Read procedures and pagination
+- GetUserProfileById:
+  - Returns columns: profile_id, user_id, username, email (if authorized), display_name, role_id, role_name, is_active, created_at, updated_at
+  - Use JOIN to Roles to include role_name
+  - Handle not-found by returning a single row with nulls or by returning o_status_code = 404 (document your convention)
+
+- GetUserProfilesByRole pagination pattern:
+  - Parameters:
+    - IN p_role_id INT
+    - IN p_page_size INT DEFAULT 25
+    - IN p_page_number INT DEFAULT 1
+    - IN p_search_term TEXT DEFAULT NULL
+    - OUT o_total_count BIGINT
+    - SETOF record (or return refcursor)
+  - Implementation notes:
+    - For offset pagination: use LIMIT p_page_size OFFSET (p_page_number - 1) * p_page_size
+    - For large datasets prefer keyset pagination (seek method) to avoid OFFSET performance pitfalls
+    - To return total_count, run SELECT COUNT(*) FROM profiles WHERE <filters> into o_total_count before fetching page.
+    - Example uses RETURNING/SELECT ... LIMIT/OFFSET; PostgreSQL uses LIMIT/OFFSET or OFFSET/FETCH.
+
+7) Permissions and testing execution rights
+- Recommended pattern:
+  - Create DB roles for application roles (app_reader, app_writer, app_admin).
+  - GRANT EXECUTE ON PROCEDURE create_user_profile(...) TO app_writer;
+  - GRANT EXECUTE ON PROCEDURE get_user_profiles_by_role(...) TO app_reader, app_admin;
+  - For tests, use SET ROLE <role> or connect as a test user to verify permission denials (e.g., attempt CALL under a role without EXECUTE and assert permission denied).
+- Document how to test permissions using SET ROLE or by connecting as a particular DB role.
+
+8) Indexing and query optimization
+- Index suggestions:
+  - UNIQUE index on users(username), users(email)
+  - Index on profiles(role_id)
+  - Composite indexes for common filters (e.g., profiles(role_id, is_active))
+- Query plan capture:
+  - Use EXPLAIN (ANALYZE, BUFFERS) for sample queries and store or attach outputs to performance docs.
+  - For automated tests, capture execution time via EXPLAIN ANALYZE or measure elapsed time in test harness.
+
+9) Concurrency strategy and metadata
+- Optimistic locking pattern:
+  - Add a row_version column (e.g., TIMESTAMP WITH TIME ZONE last_modified or BYTEA row_version using pgcrypto).
+  - Procedure accepts p_expected_row_version; UPDATE ... WHERE profile_id = p_profile_id AND row_version = p_expected_row_version
+  - If UPDATE affects 0 rows -> report concurrency conflict (status 412)
+  - Use RETURNING row_version to return the new/current version to caller.
+- PostgreSQL note:
+  - Use RETURNING <cols> rather than OUTPUT (OUTPUT is SQL Server/T-SQL). Ensure examples use PostgreSQL idioms to avoid cross-dialect confusion.
+
+10) Audit trail patterns
+- Insert an audit record inside same transaction as the change.
+- Store details as JSONB: include previous_state and new_state or a compact diff.
+- Example audit entry:
+  - details = jsonb_build_object('before', to_jsonb(old_row), 'after', to_jsonb(new_row))
+- Ensure the audit table capture performed_by and performed_at.
+
+11) Soft delete / purge patterns and retention
+- SoftDeleteUserProfile:
+  - Set is_active = false, set deleted_at = now(), deleted_by = p_performed_by
+  - Insert audit record with action 'SOFT_DELETE'
+  - Allow restore by setting is_active = true and inserted audit action 'RESTORE'
+- PurgeUserProfile:
+  - Only permit purge if is_active = false AND deleted_at < now() - INTERVAL '<retention_days> days'
+  - Before delete, check for related rows (orders, sessions, etc.); either rely on foreign keys with ON DELETE CASCADE or implement manual cleanup in the procedure to avoid orphaned references
+  - Insert audit record for 'PURGE' with details of what was removed
+- Scheduled purge job outline:
+  - Example pseudo-script (cron/system job):
+    - CALL purge_user_profile_batch(p_retention_days := 365, p_batch_size := 1000);
+    - Log the result (rows purged, errors) to daemon log table or external log.
+  - Document how to test schedule in staging before production.
+
+12) Testing patterns and teardown examples
+- Unit test patterns (SQL):
+  - Setup (insert minimal required role, user)
+  - Call procedure with test parameters
+  - Assert expected outputs (status_code, profile_id, fields in profile and audit table)
+  - Teardown:
+    - DELETE FROM audit WHERE entity_type='profile' AND entity_id = <test id>;
+    - DELETE FROM profiles WHERE profile_id = <test id>;
+    - DELETE FROM users WHERE user_id = <test user>;
+- Concurrency test:
+  - Insert row_version, call update with stale row_version and assert status_code = 412 and no data changed.
+
+13) Mapping of errors to status codes (quick reference) — reproduce the recommended convention in section 3.
+
+14) Cross-reference and links
+- Add links here to:
+  - transaction-management.md (for COMMIT/ROLLBACK caveats)
+  - cursorss.md (for cursor + transaction interactions)
+  - backup-and-restore (if present) — if not present, refer to DBA runbook.
+
+Sample minimal CreateUserProfile procedure (PostgreSQL style pseudocode):
+- Provide a compact but complete example in the file (omitted here for brevity; should be implemented in codebase following the patterns above).
+
+Notes:
+- This document uses PostgreSQL PL/pgSQL syntax and idioms. Avoid mixing T-SQL (OUTPUT) terminology. Where system-specific features are needed, call them out explicitly as dialect-specific.
