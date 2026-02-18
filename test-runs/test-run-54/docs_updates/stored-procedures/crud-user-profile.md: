@@ -1,0 +1,59 @@
+Title: CRUD Stored Procedure Patterns for User Profiles
+
+Summary:
+This page provides concrete templates and recommended patterns for implementing secure, testable CRUD stored procedures managing user profiles. It covers parameter validation, transaction handling, optimistic concurrency using a concurrency token, soft-delete patterns, return conventions, and standardized error codes.
+
+1. Table design (recommended columns):
+- id BIGSERIAL PRIMARY KEY
+- username TEXT NOT NULL UNIQUE
+- email CITEXT NOT NULL UNIQUE
+- full_name TEXT
+- password_hash TEXT NOT NULL (PII: sensitive — store hashed only)
+- phone TEXT (PII: sensitive)
+- profile_data JSONB (non-sensitive or sanitized)
+- created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+- updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+- deleted_at TIMESTAMPTZ NULL -- soft-delete marker
+- concurrency_token BYTEA or BIGINT or xmin (choose one consistent approach)
+
+PII classification:
+- Password and any direct identifiers (email, phone) considered sensitive. Recommend storing only hashed passwords and limit exposure of email/phone to authorized roles. Document retention and access policies in security docs.
+
+2. Stored procedure interface conventions (signatures):
+- CreateUser(IN username TEXT, IN email TEXT, IN password_hash TEXT, OUT user_id BIGINT, OUT error_code INT, OUT error_message TEXT)
+  - Returns new id on success (error_code = 0)
+- GetUserById(IN user_id BIGINT, OUT user_row RECORD, OUT error_code INT, OUT error_message TEXT)
+  - Returns user record (except sensitive fields) or error_code = 404
+- UpdateUser(IN user_id BIGINT, IN concurrency_token BYTEA, IN json_patch JSONB, OUT success BOOL, OUT error_code INT, OUT error_message TEXT)
+  - Uses concurrency_token to detect conflicts; returns error_code = 409 on conflict.
+- DeleteUser(IN user_id BIGINT, IN soft_delete BOOL DEFAULT TRUE, OUT success BOOL, OUT error_code INT, OUT error_message TEXT)
+  - Supports soft-delete by default (sets deleted_at); hard delete allowed when soft_delete = FALSE only for authorized roles.
+- ListUsers(IN filter JSONB, IN page_size INT, IN page_cursor TEXT, OUT users SETOF user_row, OUT next_cursor TEXT, OUT error_code INT, OUT error_message TEXT)
+  - Supports keyset pagination via page_cursor to be more scalable than OFFSET.
+
+3. Implementation patterns:
+- Parameter validation: validate IN parameters at procedure start; return standard error_code != 0 and message. Use strict length and format checks (e.g., email regex).
+- Transactions: perform multi-step operations inside an explicit transaction when invoked from CALL contexts. Use single-transaction semantics for creating/updating related tables and for audit inserts.
+- Concurrency token: include a concurrency_token column (e.g., a binary/bytea hash or numeric version). UpdateUser verifies token matches current row; if mismatch, raise standardized conflict error (error_code 409).
+- Soft-delete: set deleted_at = now(); filter out rows with deleted_at IS NOT NULL in ListUsers/GetUserById by default.
+- Least-privilege: procedures should expose only non-sensitive fields; sensitive fields only returned to roles with explicit privileges.
+
+4. Example CreateUser (outline)
+- Validate email/username length/format.
+- Begin transaction (if required by calling convention).
+- INSERT INTO user_profile (...) VALUES (...) RETURNING id INTO user_id.
+- Insert audit row (see audit doc).
+- Commit and return error_code = 0.
+
+5. Standardized error codes (recommended)
+- 0: success
+- 400: bad request / validation failed
+- 401: unauthorized
+- 403: forbidden
+- 404: not found
+- 409: concurrency conflict
+- 500: internal error / logged
+
+6. Notes and links
+- Link to the transaction-management doc for behavior of COMMIT/ROLLBACK in CALL/DO contexts.
+- Link to performance and CI docs for bulk-loading and deployment patterns.
