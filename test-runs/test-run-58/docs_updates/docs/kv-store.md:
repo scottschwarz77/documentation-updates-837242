@@ -1,0 +1,105 @@
+Title: In-Memory Thread-Safe Key-Value Store — API and Usage Guide
+
+Overview
+This document specifies the in-memory key-value store API required by applications, including function signatures, behaviors, TTL/expiration semantics, concurrency guarantees, and example usage. It is language-agnostic; where implementation details vary, recommended patterns are provided. Reference pseudocode and a sample Python implementation demonstrating thread-safety are included.
+
+API (abstract signatures)
+- set(key: string, value: any, ttl_ms?: integer) -> void
+  - Stores value under key. If ttl_ms is provided and is a positive integer, the key expires ttl_ms milliseconds after set.
+  - If key already exists, set replaces the value and the TTL (if provided). If ttl_ms is omitted when replacing, the key becomes persistent (no TTL).
+  - Input validation: key must be a non-empty string; ttl_ms must be positive integer if provided.
+
+- get(key: string) -> value | null
+  - Returns the stored value if the key is present and not expired.
+  - Returns null (or language-equivalent) if key does not exist or has expired.
+  - get must not resurrect expired keys.
+
+- delete(key: string) -> bool
+  - Removes the key if present (regardless of TTL) and returns true.
+  - Returns false if the key did not exist (or already expired).
+
+- incr(key: string, delta: integer = 1) -> integer
+  - Atomically increments the integer value stored at key by delta and returns the new value.
+  - If key does not exist or has expired, it is treated as 0 before incrementing, and the resulting new value is stored under key (with no TTL).
+  - If the existing value is not an integer type (language-appropriate integer), the implementation MUST raise/throw an error indicating "value-not-integer" (or a mapped error/exception type). The existing non-integer value must remain unchanged.
+  - The operation must be atomic under concurrent access: concurrent calls to incr must not lose updates and the final value must equal the sum of deltas from all successful incr calls.
+
+- keys(prefix?: string) -> list[string]
+  - Returns a list of currently stored keys that are not expired.
+  - If prefix is provided, only keys that start with the exact prefix string are returned.
+  - Ordering: The set of keys is treated as unordered. Implementations are allowed to return keys in any order; callers must not rely on ordering. If deterministic order is desired, callers should sort the returned list.
+  - The returned list must not include expired keys.
+
+- size() -> integer
+  - Returns the count of currently stored, non-expired keys.
+  - Expired keys must not be counted.
+
+- clear() -> void
+  - Remove all keys immediately. Any pending expiration for keys is discarded. After clear(), size() must return 0 and keys() must return an empty list.
+
+TTL / Expiration semantics
+- Units: TTL values are specified in milliseconds (ttl_ms). Implementations must document clock source assumptions. Time arithmetic must use a monotonic clock when available for correctness across system clock adjustments.
+- Expiration visibility:
+  - Expired keys must not be returned by get(), keys(), size(), or incr().
+  - Two cleanup strategies are acceptable:
+    1. Lazy cleanup (on access): Expiration is checked when a key is accessed (get, incr, delete). If expired, treat as missing and clean up the entry lazily.
+    2. Proactive/background sweeper: A background process periodically scans and removes expired keys to keep memory usage bounded and ensure size()/keys() reflect expirations promptly.
+  - Implementations should support lazy cleanup (required) and may optionally include a background sweeper for timeliness and resource control.
+- Precision and timeliness:
+  - Because of scheduling and cleanup strategy, a key with TTL=100ms may be observable for slightly longer than 100ms if only lazy cleanup is used (until next access or sweeper run). If precise expiration timing is required, choose a background sweeper with an appropriately small interval, or enforce active checking on the critical access paths.
+- Interaction with incr:
+  - If an incr() call finds key expired (either lazily or via sweeper), it should treat it as non-existent (value 0) and create a new integer value equal to delta (no TTL) — unless the implementation supports carrying prior TTL semantics across incr (not recommended). Document chosen behavior; recommended default is to treat expired as non-existent.
+
+Concurrency and thread-safety
+- The store must be safe for concurrent use from multiple threads/tasks.
+- Atomicity requirements:
+  - incr() must be atomic: concurrent increments must not overwrite each other. Implementations should protect per-key state (e.g., via per-key locks, atomic primitives, or lock-free algorithms) to guarantee this.
+  - set/delete/get/keys/size/clear must be consistent: callers must not see partially-updated state.
+- Recommended implementation patterns:
+  - Use a global concurrent map/dictionary for key lookup.
+  - Use per-key locks (e.g., a small hash of mutexes) or per-key atomic counters for incr.
+  - For minimal contention on incr of many keys, use fine-grained locks keyed by the key name.
+  - Avoid coarse-grained global locks for incr when high concurrency is expected.
+- Examples and pitfalls:
+  - Race when two threads concurrently create the same missing key with incr: make sure creation+increment is atomic (e.g., use map.compute/putIfAbsent combined with per-entry atomic integer).
+  - Clear() under concurrent access: clear() should synchronize with ongoing operations to ensure deterministic post-condition (no keys remain).
+
+Error semantics
+- If an operation fails, implementations must throw/return a clear, documented error type/exception (e.g., ValueNotIntegerError for incr on non-integer).
+- Erroneous operations must not leave the store in an inconsistent state. For example, incr on non-integer must leave the value unchanged.
+
+Performance and bulk operations
+- Complexity:
+  - get/set/delete/incr should aim for O(1) average-case time (hash table based).
+  - keys() will be O(K) where K is number of stored non-expired keys; avoid exposing expired entries.
+- Bulk insertion guidance:
+  - For large bulk inserts, consider temporary batching or disabling background sweepers until after the insert to avoid thrashing.
+- Memory considerations:
+  - Implementations should remove expired entries promptly to avoid unbounded memory growth. A background sweeper is recommended for workloads with many short-lived keys.
+
+Sample pseudo-code (conceptual)
+- Shows reasoning for atomic incr and TTL-aware get.
+  - Use a concurrent map: map[key] -> { value, expires_at_ms | null, lock }
+  - set(): store value and compute expires_at_ms if ttl_ms provided; release lock.
+  - get(): check entry; if expires_at_ms != null && now >= expires_at_ms => remove entry and return null; else return value.
+  - incr(): acquire per-key lock (create entry if needed), re-check expiration under lock, if nonexistent or expired treat as 0, else verify integer, update value, release lock, return new integer.
+
+Reference Python sample (illustrative, not production)
+- A concise thread-safe example demonstrates usage of threading.Lock and background sweeper. (Code snippet omitted here for brevity — see sample implementation file docs/examples/python_kv_store.py)
+
+Testing recommendations
+- Unit tests:
+  - Basic CRUD and TTL tests (as in the test plan).
+  - incr error flows and non-integer behavior.
+- Concurrency tests:
+  - Multi-threaded incr test: N threads * M increments => assert final value == N*M.
+  - Concurrent incr on non-existent keys.
+- TTL/cleanup tests:
+  - Lazy vs sweeper checks: verify expired keys are removed within configured sweeper intervals.
+
+Notes and Known Limitations
+- Ordering of keys() is undefined. Callers that need ordered results should sort on the client side.
+- Implementations should document their chosen clock source (system time vs monotonic).
+- Background sweeper interval trades off timeliness and CPU/network usage; choose based on workload.
+
+End of document.
