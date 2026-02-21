@@ -1,0 +1,9 @@
+# Sample reference implementation (illustrative, not production-grade)
+# Demonstrates a thread-safe in-memory key-value store with TTL and atomic incr.
+# Uses threading.Lock and per-key fine-grained locking.
+
+# NOTE: This file is a conceptual sample to show recommended patterns.
+# Implementations in other languages should follow the same semantics outlined
+# in docs/kv-store.md.
+
+[See attached code file in repository: docs/examples/python_kv_store.py — includes a simple class KVStore with set/get/delete/incr/keys/size/clear, per-key locks, lazy expiration, optional background sweeper, and tests reflecting the specified test cases.]
