@@ -1,0 +1,270 @@
+Overview
+This document specifies a recommended, practical implementation guide for a Developer implementing the "Todo" REST API service described by the task. It is intended to fill gaps identified in higher-level system docs (endpoints, auth, validation, Docker, tests). The guidance is opinionated (a recommended reference implementation) and includes concrete examples.
+
+Chosen stack (recommended)
+- Language / framework: Node.js (>=18) with Express.js for HTTP server.
+- Database: PostgreSQL (>=14).
+- Auth: JSON Web Tokens (JWT) using HS256 for access tokens (sufficient for a single-service deployment). Use RS256 and rotating keys for production if needed.
+- ORM/query: Knex.js or Objection.js, or use raw pg driver. Examples here assume Knex.
+- Test runner: Jest + supertest for integration tests.
+- Containerization: Docker + optional docker-compose for local dev and tests.
+
+Service layout (example)
+- src/
+  - app.js (Express app)
+  - server.js (starts server)
+  - routes/
+    - auth.js
+    - todos.js
+  - controllers/
+    - authController.js
+    - todosController.js
+  - models/
+    - todoModel.js
+    - userModel.js
+  - db/
+    - knexfile.js
+    - migrations/
+    - seeds/
+  - middleware/
+    - authMiddleware.js
+    - errorHandler.js
+  - tests/
+    - integration/
+- package.json
+- Dockerfile
+- docker-compose.yml
+- README.md
+
+API contract (JSON; rigid canonical form)
+- All responses are application/json unless otherwise specified. Include header:
+  Content-Type: application/json; charset=utf-8
+
+Health
+- GET /health
+  - 200 OK
+  - Body: {"status":"ok","uptime_seconds":123}
+  - Purpose: quick liveness check used by docker/k8s.
+
+Authentication / Users
+- POST /register
+  - Request: application/json
+    {"email":"alice@example.com","password":"Str0ngP@ss!"}
+  - Server-side:
+    - Validate email format and password strength.
+    - Hash password (bcrypt or argon2).
+    - Create user record.
+  - Response:
+    - 201 Created
+    - Body: {"id": "<user-id>", "email":"alice@example.com", "created_at":"2026-01-01T00:00:00Z"}
+- POST /login
+  - Request:
+    {"email":"alice@example.com","password":"Str0ngP@ss!"}
+  - Response:
+    - 200 OK
+    - Body: {"token":"<jwt-token>", "token_type":"Bearer", "expires_in":3600}
+  - Failure:
+    - 401 Unauthorized
+    - Body: {"error":"invalid_credentials","message":"Invalid email or password"}
+
+Authentication details
+- JWT payload (example minimal):
+  {
+    "sub": "<user-id>",
+    "iat": 1610000000,
+    "exp": 1610003600
+  }
+- Authorization header on protected endpoints:
+  Authorization: Bearer <token>
+- On receiving a token, validate signature, expiration, and load user id (sub). Use middleware to set req.user = { id: <user-id>, email: ... }.
+
+Todo resource schema
+- Fields:
+  - id: string/uuid (server-generated)
+  - user_id: string/uuid (owner; set server-side from authenticated user)
+  - title: string (required)
+  - description: string (optional)
+  - due_date: ISO 8601 timestamp (optional) e.g., "2026-03-01T12:00:00Z"
+  - completed: boolean (default false)
+  - created_at: ISO 8601 timestamp (server-generated)
+  - updated_at: ISO 8601 timestamp (server-generated)
+- Validation:
+  - title: required, non-empty, max length (e.g., 255)
+  - due_date: if present, must parse as ISO 8601 (use date-time format, in UTC recommended)
+  - completed: boolean if present
+
+Endpoints (HTTP + examples)
+
+- GET /todos
+  - Description: list authenticated user's todos
+  - Query params:
+    - page (int, default 1)
+    - per_page (int, default 10, max 100)
+    - completed (optional) — "true" or "false"
+  - Behavior:
+    - Only return todos where user_id == authenticated user id.
+    - Apply filtering if completed provided.
+    - Return pagination metadata.
+  - Response 200 OK:
+    {
+      "data": [ {todo}, ... ],
+      "meta": {
+        "page": 1,
+        "per_page": 10,
+        "total": 42,
+        "total_pages": 5
+      }
+    }
+
+- POST /todos
+  - Create new todo for current user.
+  - Request body:
+    {"title":"Buy milk","description":"2 liters","due_date":"2026-03-01T12:00:00Z"}
+  - Response:
+    - 201 Created
+    - Body: { "id": "...", "user_id":"...", "title":"Buy milk", "description":"2 liters", "due_date":"2026-03-01T12:00:00Z", "completed":false, "created_at":"...", "updated_at":"..." }
+  - Validation failures:
+    - 400 Bad Request
+    - {"error":"validation_failed","details":[{"field":"title","message":"Title is required"}]}
+
+- GET /todos/{id}
+  - Return the todo if owned by authenticated user.
+  - If not owned: return 404 Not Found (preferred, hides existence) OR 403 Forbidden (if you choose to reveal existence). Document chosen policy; default: 404.
+  - 200 OK: todo JSON.
+
+- PATCH /todos/{id}
+  - Partial update allowed. Accept a subset of fields: title, description, due_date, completed.
+  - Validate inputs. Update updated_at.
+  - Response 200 OK: updated todo.
+
+- PUT /todos/{id}
+  - Optional: full replace. If implemented, require all required fields.
+
+- DELETE /todos/{id}
+  - Delete the todo if owned by authenticated user.
+  - Response: 204 No Content (preferred).
+  - If not found/unauthorized: 404 Not Found.
+
+Error response canonical format
+- Use a consistent JSON error shape:
+  {
+    "error": "<short_code>",
+    "message": "<human readable message>",
+    "details": [ { "field": "title", "message": "Title is required" } ] // optional
+  }
+
+Authorization and per-user enforcement
+- All /todos endpoints require Authorization.
+- Server must enforce WHERE user_id = current_user_id for all read/update/delete queries.
+- For attempts to access resources not owned by the user, return 404 Not Found by default (helps avoid information leakage). Document this choice.
+
+Pagination details
+- Default per_page=10; max per_page=100.
+- Validate page/per_page query params; return 400 if invalid.
+- meta.total should be count of all matching records for the current user (respecting filters).
+
+Database schema example (Postgres)
+- users table:
+  - id UUID primary key
+  - email text unique not null
+  - password_hash text not null
+  - created_at timestamp with time zone default now()
+- todos table:
+  - id UUID primary key
+  - user_id UUID references users(id) not null
+  - title text not null
+  - description text
+  - due_date timestamp with time zone
+  - completed boolean default false
+  - created_at timestamp with time zone default now()
+  - updated_at timestamp with time zone default now()
+- Indexes:
+  - index on todos(user_id)
+  - index on (user_id, completed) to support filtering
+
+Transactions & concurrency (practical guidance)
+- For typical create/update/delete operations, perform each API operation in a single DB transaction and commit/rollback as needed.
+- For update concurrency control, consider adding a version column (integer) or updated_at and implement optimistic locking:
+  - Include version or updated_at in the PATCH payload (or ETag/If-Match header).
+  - UPDATE ... WHERE id = $1 AND version = $2; if rows_affected == 0 => return 409 Conflict.
+- Note: transaction-management.md describes COMMIT/ROLLBACK behavior and warns about cursor loops turning into holdable cursors after a COMMIT. That is useful if you implement heavy cursor-based server-side procedures — but for a REST API operating on single-row updates, prefer simple single-statement transactions and optimistic locking as above.
+
+Logging and error handling
+- Return structured JSON errors as above.
+- Log internal errors on the server (stack traces) but avoid exposing stack traces to clients. Return 500 with {"error":"internal_server_error","message":"An unexpected error occurred"}.
+- Write logs to stdout/stderr so container orchestration can capture them.
+
+Rate limiting
+- If rate limiting is desired, implement a policy (e.g., per-user 100 requests/min). When limit exceeded:
+  - Return 429 Too Many Requests.
+  - Include Retry-After header with number of seconds.
+- Document any chosen limits.
+
+Health checks and readiness
+- Provide /health (liveness) and /ready (readiness). /ready should check DB connectivity.
+- Use 200 for healthy, 503 for not ready.
+
+Dockerfile (example)
+- Dockerfile:
+  FROM node:18-alpine
+  WORKDIR /app
+  COPY package*.json ./
+  RUN npm ci --production
+  COPY . .
+  ENV NODE_ENV=production
+  EXPOSE 8000
+  CMD ["node","server.js"]
+
+docker-compose.yml (example for local development)
+version: "3.8"
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: todo_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+  app:
+    build: .
+    environment:
+      DATABASE_URL: postgres://app:secret@db:5432/todo_dev
+      JWT_SECRET: "replace-with-secure-secret"
+      PORT: 8000
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+volumes:
+  db-data:
+
+Testing guidance
+- Unit tests: mock DB interactions.
+- Integration tests: use a test Postgres container (docker-compose.override.yml) or a transactional test DB per test run. Use Jest + supertest to start a test instance and run HTTP requests.
+- Tests to provide:
+  - Health endpoint test
+  - Auth register/login + invalid credential tests
+  - CRUD tests for /todos including validation errors
+  - Pagination and filtering tests
+  - Authorization tests ensuring users cannot access others' todos
+- Cleanup:
+  - For integration tests, run DB migrations on a fresh test DB, run tests, then drop DB or run rollback migrations.
+  - Alternatively, wrap each test in a DB transaction and roll it back after test completes (requires the app to support running inside a test transaction or using fixtures).
+
+CI / automation
+- Run linters, unit tests, and integration tests in CI.
+- Use an ephemeral test DB service in CI (e.g., Postgres service in GitHub Actions or use a Docker container).
+
+Security
+- Store JWT secret securely (env var or secret manager).
+- Use HTTPS in production.
+- Rate-limit login attempts (prevent brute-force).
+- Use prepared statements/ORM to prevent SQL injection.
+
+Notes / references
+- The existing stored-procedures/transaction-management.md is relevant to understanding transaction commands when you write stored procedures that themselves manage transactions. It warns that COMMIT inside cursor loops may cause cursor queries to be fully evaluated (holdable cursors). Use that knowledge if you plan server-side stored procedures that iterate large result sets.
+
+End of developer/todo-api.md
