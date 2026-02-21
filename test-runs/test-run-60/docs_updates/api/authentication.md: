@@ -1,0 +1,160 @@
+# Authentication API
+
+Overview
+This page documents the server's authentication endpoints and recommended secure implementation practices for developers.
+
+Endpoints
+1) POST /api/v1/auth/login
+- Request (application/json):
+  {
+    "email": "user@example.com",
+    "password": "plain-text-password"
+  }
+- Responses:
+  - 200 OK
+    {
+      "access_token": "<JWT>",
+      "refresh_token": "<opaque>",
+      "token_type": "Bearer",
+      "expires_in": 900
+    }
+    Notes:
+      - access_token: JWT (see JWT section below) valid for 15 minutes (900 seconds).
+      - refresh_token: opaque token valid for 7 days. Store securely server-side (see storage guidance).
+      - expires_in: seconds until access token expiration.
+  - 400 Bad Request
+    {
+      "errors": {
+        "email": "Invalid email",
+        "password": "Required"
+      }
+    }
+    Use structured field-level error objects for validation errors.
+  - 401 Unauthorized
+    {
+      "error": "Invalid credentials"
+    }
+    Use a generic message — do not reveal whether the email exists.
+  - 429 Too Many Requests
+    {
+      "error": "Too many failed login attempts. Try again later."
+    }
+    Include Retry-After header where applicable.
+
+2) POST /api/v1/auth/refresh
+- Request (application/json):
+  {
+    "refresh_token": "<opaque token>"
+  }
+- Responses:
+  - 200 OK: returns a new access_token (and optionally a rotated refresh_token)
+    {
+      "access_token": "<new JWT>",
+      "refresh_token": "<new opaque>"  // optional; if present, rotate refresh tokens
+      "token_type": "Bearer",
+      "expires_in": 900
+    }
+  - 400 / 401: invalid or expired refresh token
+
+JWT (access_token) guidance
+- JWT format: three base64url-encoded parts separated by dots.
+- Signing:
+  - HS256 or RS256 supported. Prefer RS256 (asymmetric) for key separation when feasible.
+  - If using HS256, securely manage and rotate the HMAC secret.
+  - If using RS256, publish the signing public key via secure key distribution or JWKS if using multiple services.
+- Required claims:
+  - sub: user id (string or numeric; normalize to string in docs)
+  - iat: issued-at (numeric, epoch seconds)
+  - exp: expiration timestamp (iat + 900)
+  - roles: array of role strings (optional, include if any)
+- Verify signature and exp on protected endpoints; reject tokens with invalid signature or expired exp.
+
+Token lifetimes
+- access_token: 15 minutes (900 seconds).
+- refresh_token: 7 days by default. Consider refresh token rotation and single-use tokens for stronger security.
+
+Security and storage recommendations
+- Passwords:
+  - Store only bcrypt-hashed passwords (bcrypt with a work factor appropriate for your environment).
+  - On login, compare bcrypt(hash, provided_password) using a constant-time comparison function provided by your crypto library.
+- Refresh tokens:
+  - Store refresh tokens server-side (database) with these fields: token hash (store hashed version), user_id, issued_at, expires_at, revoked (boolean), last_used_at.
+  - When issuing a refresh token, store only a hashed representation (e.g., HMAC or bcrypt) so the raw token is not in DB.
+  - Prefer refresh-token rotation: when a refresh is used, issue a new refresh token and mark the old token revoked. If a revoked token is used, treat as potential theft — revoke all tokens for the user and require re-authentication.
+  - Invalidate refresh tokens on password change or manual logout (mark revoked).
+- SQL injection:
+  - Always use parameterized queries or an ORM's parameter binding (do NOT concatenate user input into SQL).
+  - Example (pseudo-SQL parameterized):
+    SELECT id, password_hash FROM users WHERE email = $1;
+  - Log query parameters separately from SQL; trace logs should not show raw secrets.
+
+Error handling and privacy
+- Return generic error messages for authentication failures to avoid user enumeration.
+- Record failed attempts (with rate-limiting) but avoid logging sensitive fields like passwords.
+
+Rate limiting / brute-force mitigation (brief guidance)
+- Apply per-account and per-IP failed-attempt tracking.
+- Example policy: after 5 failed attempts within 15 minutes for an account or IP, return 429 with Retry-After header; or temporarily lock account for a short period (e.g., 15 minutes).
+- Ensure lockout decisions are logged and reviewable.
+
+Testing guidance
+- Unit tests:
+  - Seed a test user with bcrypt hash and known id/roles.
+  - Test correct login path: response contains access_token (three parts), refresh_token, correct token_type and expires_in.
+  - Decode JWT and verify sub, iat, exp, roles.
+- Expiry testing:
+  - In test environments, create tokens with exp in the past or allow test clock manipulation to simulate expiry.
+  - Verify protected endpoints return 401 for expired access tokens.
+- Refresh flow:
+  - Test refresh endpoint returns a new access_token and rotates refresh_token if rotation is enabled.
+  - Test reusing a rotated refresh_token (if single-use) is rejected.
+
+Notes
+- This document is a reference for implementing the auth endpoints. Implementation details (libraries, frameworks) will vary by tech stack — follow the security guidance above when mapping to your stack.
+
+DOCS_FILE api/security.md:
+# Authentication Security Best Practices
+
+Purpose
+This page expands on secure implementation details referenced by the Authentication API doc.
+
+Password storage
+- Use bcrypt with a cost/work factor appropriate to your deployment (e.g., bcrypt cost 12+ depending on CPU).
+- Never store plaintext passwords.
+- Use libs that perform constant-time comparisons when verifying hashes.
+
+Refresh token storage and rotation
+- Store a hashed version of the refresh token in DB (do not store raw tokens).
+- Table columns example:
+  - id (PK), user_id, token_hash, issued_at, expires_at, revoked (boolean), last_used_at, ip_address, user_agent
+- On refresh:
+  - Validate token_hash and expiry.
+  - If valid and rotation enabled:
+    - create new refresh token, hash & store it, mark old token revoked and set last_used_at.
+    - return new refresh token to client.
+  - If token invalid or revoked: reject and consider revoking all refresh tokens for the user (possible token compromise).
+
+Preventing SQL injection
+- Always use parameterized queries or ORM parameter binding. Example (Node/pg):
+  const text = 'SELECT id, password_hash FROM users WHERE email = $1';
+  const values = [email];
+  client.query(text, values);
+- Avoid building SQL using string concatenation with user input.
+- Use prepared statements where possible.
+
+Logging and monitoring
+- Log authentication failures (timestamp, user identifier if available, source IP), but do not log raw passwords or raw refresh tokens.
+- Monitor failed-auth spikes and anomalous refresh-token activity.
+
+Key management
+- For HS256: rotate the shared secret periodically and provide key identifiers if multiple keys are in use.
+- For RS256: rotate signing keys and publish current public keys via a JWKS endpoint for service-to-service verification.
+
+DOCS_FILE docs/_sidebar.md:
+- Overview
+- API
+  - Authentication (api/authentication.md)
+  - (other API pages...)
+- Security
+  - Authentication Security (api/security.md)
+- (rest of sidebar)
